@@ -41,6 +41,16 @@ const startAppForPrimary = async () => {
   for (let i = 0; i < NUM_CLUSTER_WORKERS; i++) {
     cluster.fork()
   }
+
+  // Respawn workers when they die
+  cluster.on('exit', (worker, code, signal) => {
+    log(
+      `Worker process with pid=${worker.process.pid} died because ${
+        signal || code
+      }. Respawning...`
+    )
+    cluster.fork()
+  })
 }
 
 // Workers don't share memory - each is its own process running its own Express app and Redis connections for Bull queues
