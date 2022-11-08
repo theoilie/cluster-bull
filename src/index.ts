@@ -12,6 +12,26 @@ const CLUSTER_ENABLED = true
 const NUM_CLUSTER_WORKERS = 2
 const BULL_CONCURRENCY_PER_PROCESS = 5
 
+/**
+ * Path 1 to trigger the error - without this initComplete flow, "missing lock for job" will happen if you:
+ * 1. Start the app once, wait a minute, and kill a worker
+ * 2. Restart the app
+ * 
+ * This is possibly caused by the second worker initting and processing a job that
+ * the first worker is still trying to remove.
+ */
+const SHOULD_TRIGGER_ERROR_PATH1 = false
+
+/**
+ * Path 2 to trigger the error - if every worker calls `queue.obliterate({ force: true })`:
+ * 1. Start the app, wait a minute, and kill a worker.
+ * 2. The "missing lock for job" error should be logged. If not, repeat a couple of times.
+ * 
+ * This is possibly caused by one worker trying work on a job while another worker
+ * tries to obliterate that job.
+ */
+const SHOULD_TRIGGER_ERROR_PATH2 = false
+
 const log = (msg: any) => {
   const worker = cluster.worker?.id ?? 'primary'
   console.log(`[worker ${worker}] ${msg}`)
@@ -28,18 +48,45 @@ const addJobsToQueue = async (queue: Queue) => {
   }
 }
 
+const deleteOldActiveJobs = async (queue: Queue) => {
+  const oldActiveJobs = await queue.getJobs(['active'])
+  log(
+    `Removing ${oldActiveJobs.length} leftover active jobs from ${queue.name}`
+  )
+  return Promise.allSettled(oldActiveJobs.map((job) => job.remove()))
+}
+
 const timeout = (ms: number) => {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 // The primary process performs one-time validation and spawns worker processes that each run the Express app
 const startAppForPrimary = async () => {
-  log(`Primary process with pid=${process.pid} is running`)
+  log(`Primary process with pid=${process.pid} is running...`)
+  const errorExpected = SHOULD_TRIGGER_ERROR_PATH1 || SHOULD_TRIGGER_ERROR_PATH2
+  if (errorExpected) {
+    log('Expect to see an error if you kill a process and restarting (hot reload).')
+  } else {
+    log('There should NOT be any errors after killing a process and restarting (hot reload)/')
+  }
 
   // Spawn cluster workers (child processes of the primary)
   log(`Spawning ${NUM_CLUSTER_WORKERS} processes to run the Express app. Each will have its own queue worker to process ${BULL_CONCURRENCY_PER_PROCESS} Bull jobs concurrently...`)
-  for (let i = 0; i < NUM_CLUSTER_WORKERS; i++) {
-    cluster.fork()
+  
+  if (SHOULD_TRIGGER_ERROR_PATH1) {
+    for (let i = 0; i < NUM_CLUSTER_WORKERS; i++) {
+      cluster.fork()
+    }
+  } else {
+    // Wait for the first worker to perform one-time cleanup logic before spawning other workers
+    const firstWorker = cluster.fork()
+    firstWorker.on('message', (msg) => {
+      if (msg?.cmd === 'initComplete') {
+        for (let i = 0; i < NUM_CLUSTER_WORKERS - 1; i++) {
+          cluster.fork()
+        }
+      }
+    })
   }
 
   // Respawn workers when they die
@@ -76,7 +123,12 @@ const startApp = async () => {
     port: REDIS_PORT
   } as any
   const queue = new Queue(queueName, { connection })
-  await queue.obliterate({ force: true })
+  if (SHOULD_TRIGGER_ERROR_PATH2) {
+    await queue.obliterate({ force: true })
+  } else if (cluster.worker?.id === 1) {
+    await queue.obliterate({ force: true })
+    await deleteOldActiveJobs(queue)
+  }
   new Worker(
     queueName,
     async (job) => {
@@ -97,6 +149,10 @@ const startApp = async () => {
   })
   serverAdapter.setBasePath('/dashboard')
   app.use('/dashboard', serverAdapter.getRouter())
+
+   if (cluster.worker?.id === 1 && process.send) {
+    process.send({ cmd: 'initComplete' })
+  }
 
   await addJobsToQueue(queue)
 }
